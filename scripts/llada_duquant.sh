@@ -14,7 +14,7 @@ A_BIT=8
 # --lac: the ratio of activation clipping
 # we use asymmetric per-channel quantization for weights and per-tensor quantization for activations in DuQuant
 
-#python $DIRPATH/DuQuant/generate_act_scale_shift.py --model $MODEL_PATH
+python $DIRPATH/DuQuant/generate_act_scale_shift.py --model $MODEL_PATH
 
 # general tasks
 # --tasks hellaswag,piqa,winogrande,arc_easy,arc_challenge
