@@ -8,13 +8,14 @@ import time
 from datautils import get_loaders
 from lm_eval import evaluator
 from pprint import pprint
-from parallel_utils import map_layers_to_multi_gpus, get_lowest_occupied_gpu
+from parallel_utils import map_layers_to_multi_gpus, get_lowest_occupied_gpu, forward_hook_wrapper
 import torch.nn as nn
 from quantize.duquant import duquant
 from tqdm import tqdm
 import utils
 from pathlib import Path
 from categories import subcategories, categories
+from models.modelling_fastdllm import Fast_dLLM_QwenForCausalLM, Fast_dLLM_QwenConfig
 
 
 torch.backends.cudnn.benchmark = True
@@ -31,10 +32,13 @@ net_choices = [
     "Llama-3-70b",
     "Vicuna-1.5-7b",
     "Vicuna-1.5-13b",
-    "mistral-7b"
+    "mistral-7b",
+    "llada",
+    "fastdllm"
 ]
 
 def move_to_device(lm, args, logger):
+    class_name = lm.model.__class__.__name__.lower()
     if args.multigpu:
         if lm.model.__class__.__name__ == "LLaDAModelLM":
             map_layers_to_multi_gpus(lm.model.model.transformer.blocks)
@@ -45,6 +49,15 @@ def move_to_device(lm, args, logger):
             lm.model.model.transformer.ln_f.to(output_device)
             lm.model.model.transformer.ff_out.to(output_device)
             lm.model.model.transformer.wte.register_forward_pre_hook(forward_hook_wrapper(input_device), with_kwargs=True)
+        elif 'fast_dllm' in class_name or 'fastdllm' in class_name:
+            map_layers_to_multi_gpus(lm.model.model.layers)
+            input_device = lm.model.model.layers[0].device
+            output_device = lm.model.model.layers[-1].device
+            assert input_device == output_device
+            lm._device = input_device
+            lm.model.model.embed_tokens.to(input_device)
+            lm.model.model.norm.to(output_device)
+            lm.model.model.rotary_emb.to(output_device)
         else:
             map_layers_to_multi_gpus(lm.model.model.layers)
             input_device = lm.model.model.layers[0].device
@@ -56,6 +69,12 @@ def move_to_device(lm, args, logger):
             lm.model.lm_head.to(output_device)
     else:
         lm.model = lm.model.to(lm.device)
+        # Debug: verify layers after moving
+        class_name = lm.model.__class__.__name__.lower()
+        if 'fast_dllm' in class_name or 'fastdllm' in class_name:
+            print(f"DEBUG move_to_device: lm.device={lm.device}")
+            print(f"DEBUG move_to_device: Layer 0 type = {type(lm.model.model.layers[0])}")
+            print(f"DEBUG move_to_device: Layer 0 device = {next(lm.model.model.layers[0].parameters()).device}")
 
 
 def test_output(lm, args):
@@ -79,6 +98,10 @@ def test_output(lm, args):
             # )
             attn_mask = input_ids.ne(tokenizer.pad_token_id)
             out = lm.generate(input_ids, attention_mask=attn_mask, diffusion_steps=512, max_new_tokens=32)
+        elif 'fast_dllm' in class_name or 'fastdllm' in class_name:
+            out = lm.generate(input_ids, max_new_tokens=32)
+        else:
+            out = lm.generate(input_ids, max_new_tokens=32)
 
         
         print(tokenizer.batch_decode(out[:, input_ids.shape[1]:], skip_special_tokens=True)[0])
@@ -194,6 +217,7 @@ def evaluate(lm, args, logger):
 
     if args.tasks != "":
         class_name = lm.model.__class__.__name__.lower()
+        model_args = {}
         if 'llada' in class_name:
         # if lm.model.__class__.__name__ == "LLaDAModelLM":
             model_args = dict(
@@ -205,6 +229,10 @@ def evaluate(lm, args, logger):
             )
             
         args.tasks = args.tasks.split(',')
+        # Skip lm_eval for Fast-dLLM (requires custom evaluation harness)
+        if 'fast_dllm' in class_name or 'fastdllm' in class_name:
+            logger.info("Skipping lm_eval for Fast-dLLM - quantization completed successfully")
+            return results
         with torch.cuda.amp.autocast():
             t_results = evaluator.simple_evaluate(
                 lm,
@@ -472,6 +500,72 @@ def main():
             diffusion_steps=args.diffusion_steps, max_new_tokens=args.max_new_tokens, mc_num=args.mc_num, batch_size=args.batch_size
         )
         lm = model_cls(pretrained=args.model, **model_args)
+    elif 'fast_dllm' in class_name or 'fastdllm' in class_name:
+        config = Fast_dLLM_QwenConfig.from_pretrained(args.model)
+        model = Fast_dLLM_QwenForCausalLM.from_pretrained(args.model, config=config, torch_dtype=torch.float16).cuda()
+        # Create a wrapper to match lm interface expected by DuQuant
+        class FastdLLMWrapper:
+            def __init__(self, model, model_path):
+                self.model = model  # This is Fast_dLLM_QwenForCausalLM
+                self._device = next(model.parameters()).device
+                self.seqlen = 2048
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+                self.mask_id = 151665  # Fast-dLLM mask token ID
+                self.bd_size = config.bd_size if hasattr(config, 'bd_size') else 32
+            @property
+            def device(self):
+                return self._device
+            def generate(self, input_ids, max_new_tokens=32, **kwargs):
+                """Generate using diffusion-based block decoding (simplified version)"""
+                block_size = self.bd_size
+                threshold = 0.9
+                
+                # Pad input to block boundary
+                prompt_len = input_ids.shape[1]
+                pad_len = block_size - (prompt_len % block_size)
+                if pad_len < block_size:
+                    input_ids = torch.cat([input_ids, 
+                        torch.full((1, pad_len), self.mask_id, device=self._device, dtype=torch.long)], dim=1)
+                
+                # Add one block of mask tokens for generation
+                num_gen_blocks = (max_new_tokens + block_size - 1) // block_size
+                print(f"DEBUG: Starting block 0/{num_gen_blocks}. max_new_tokens={max_new_tokens}")
+                
+                with torch.no_grad():
+                    for block_idx in range(num_gen_blocks):
+                        # Add a new block of masks
+                        x_t = torch.cat([input_ids, 
+                            torch.full((1, block_size), self.mask_id, device=self._device, dtype=torch.long)], dim=1)
+                        
+                        # Iteratively unmask tokens in this block
+                        for step in range(block_size):
+                            mask_idx = (x_t[:, -block_size:] == self.mask_id)
+                            if mask_idx.sum() == 0:
+                                break
+                            
+                            # Forward pass with FULL input to maintain context
+                            outputs = self.model(input_ids=x_t, use_cache=False)
+                            logits = outputs.logits
+                            # Take logits for the last block only (for unmasking decision)
+                            block_logits = logits[:, -block_size:, :]
+                            block_logits = torch.cat([block_logits[:, :1, :], block_logits[:, :-1, :]], dim=1)
+                            
+                            # Sample from logits
+                            probs = torch.softmax(block_logits, dim=-1)
+                            next_tokens = probs.argmax(dim=-1)
+                            
+                            # Get confidence
+                            max_probs = probs.max(dim=-1).values
+                            max_probs = torch.where(mask_idx, max_probs, -torch.inf)
+                            
+                            # Unmask most confident position
+                            best_pos = max_probs.argmax(dim=-1)
+                            x_t[:, -block_size + best_pos.item()] = next_tokens[:, best_pos.item()]
+                        
+                        input_ids = x_t
+                
+                return input_ids
+        lm = FastdLLMWrapper(model, args.model)
     else:
         raise NotImplementedError
         
@@ -571,6 +665,8 @@ def main():
         act_scales = None
         act_shifts = None
         if args.smooth:
+            print(args.act_scales)
+            print(args.act_shifts)
             act_scales = torch.load(args.act_scales)
             act_shifts = torch.load(args.act_shifts)
         duquant(

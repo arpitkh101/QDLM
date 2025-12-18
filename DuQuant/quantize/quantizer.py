@@ -329,6 +329,8 @@ class UniformAffineQuantizer(nn.Module):
                             x = x.matmul(R).reshape(x_size).squeeze(0)
                             # if False:
                             if True:
+                                if len(x.shape) == 1:
+                                    x = x.unsqueeze(0)
                                 if len(self.permutation_list.shape) == 3:
                                     perm = (self.permutation_list[i, 0].to(x.device), self.permutation_list[i, 1].to(x.device))
                                     x[:, perm[0]], x[:, perm[1]] = x[:, perm[1]], x[:, perm[0]]

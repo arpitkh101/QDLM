@@ -133,11 +133,19 @@ def assign_layers_to_gpus(layers: List[nn.Module]):
 
 # forward hook
 def forward_hook_wrapper(gpu_id):
+    # Handle case where gpu_id is already a device string like 'cuda:1'
+    if isinstance(gpu_id, str):
+        device = gpu_id
+    elif hasattr(gpu_id, 'type'):  # torch.device
+        device = str(gpu_id)
+    else:
+        device = f"cuda:{gpu_id}"
+    
     def forward_hook(module, input, kwargs):
         # breakpoint()
-        input = tuple(_.to(f"cuda:{gpu_id}") for _ in input)
+        input = tuple(_.to(device) for _ in input)
         kwargs = {
-            k: v.to(f"cuda:{gpu_id}") if isinstance(v, torch.Tensor) else v
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
             for k, v in kwargs.items()
         }
         return input, kwargs

@@ -9,6 +9,7 @@ from transformers import (
 )
 import argparse
 import torch.nn as nn
+from models.modelling_fastdllm import Fast_dLLM_QwenForCausalLM, Fast_dLLM_QwenConfig
 
 from datasets import load_dataset
 import functools
@@ -101,7 +102,11 @@ def build_model_and_tokenizer(model_name):
     kwargs = {"torch_dtype": torch.float16, "device_map": "auto"}
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False,legacy=False, trust_remote_code=True)
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, **kwargs)
+        if 'fast_dllm' in model_name.lower() or 'fastdllm' in model_name.lower():
+            config = Fast_dLLM_QwenConfig.from_pretrained(model_name)
+            model = Fast_dLLM_QwenForCausalLM.from_pretrained(model_name, config=config, **kwargs)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True, **kwargs)
     except:
         model = AutoModel.from_pretrained(model_name, trust_remote_code=True, **kwargs)
     return model, tokenizer

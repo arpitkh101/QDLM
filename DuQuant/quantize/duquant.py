@@ -3,7 +3,9 @@ import torch.nn as nn
 from models.int_llama_layer import QuantLlamaDecoderLayer
 from models.int_mistral_layer import QuantMistralDecoderLayer
 from models.int_llada_layer import QuantLLadaDecoderLayer
+from models.int_llada_layer import QuantLLadaDecoderLayer
 from models.int_dream_layer import QuantDreamDecoderLayer
+from models.int_fastdllm_layer import QuantFastdLLMDecoderLayer
 from quantize.int_linear import QuantLinear
 from contextlib import nullcontext
 import copy
@@ -54,6 +56,8 @@ def duquant(
     use_cache = model.config.use_cache
     model.config.use_cache = False
     is_llama = False
+    is_fastdllm = False
+    print(args.net,"########")
     if "llama" in args.net.lower() or "vicuna" in args.net.lower():
         is_llama = True
         layers = model.model.layers
@@ -98,6 +102,21 @@ def duquant(
         model.model.embed_tokens = model.model.embed_tokens.to(dev)
         model.model.norm = model.model.norm.to(dev)
         DecoderLayer = QuantDreamDecoderLayer
+        pairs = {
+            "q_proj":"qkv",
+            "o_proj":"out",
+            "up_proj":"fc1",
+            "down_proj":"down",
+        }
+        layer_name_prefix = "model.layers"
+    elif "fast_dllm" in args.net.lower() or "fastdllm" in args.net.lower() or "fast_dllm" in args.model.lower() or "fastdllm" in args.model.lower():
+        is_llama = True
+        is_fastdllm = True
+        layers = model.model.layers
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+        model.model.rotary_emb = model.model.rotary_emb.to(dev)
+        DecoderLayer = QuantFastdLLMDecoderLayer
         pairs = {
             "q_proj":"qkv",
             "o_proj":"out",
@@ -153,9 +172,12 @@ def duquant(
     # move embedding layer and first layer to cpu
     layers[0] = layers[0].module
     layers[0] = layers[0].cpu()
+    layers[0] = layers[0].cpu()
     if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "mistral" in args.net.lower() or "dream" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.cpu()
         model.model.norm = model.model.norm.cpu()
+    elif "fast_dllm" in args.net.lower() or "fastdllm" in args.net.lower() or "fast_dllm" in args.model.lower() or "fastdllm" in args.model.lower():
+        pass  # embeddings already on GPU, don't move to CPU
     elif 'llada' in args.net.lower():
         # model.model.transformer.embed_tokens = model.model.transformer.wte.cpu()
         pass
@@ -186,6 +208,18 @@ def duquant(
         position_ids = cache["position_ids"]
     else:
         position_ids = None
+
+    if "fast_dllm" in args.net.lower() or "fastdllm" in args.net.lower() or "fast_dllm" in args.model.lower() or "fastdllm" in args.model.lower():
+        if position_ids is None:
+            position_ids = torch.arange(inps.shape[1], device=dev).unsqueeze(0)
+        cos, sin = model.model.rotary_emb(inps[0].unsqueeze(0), position_ids=position_ids)
+        position_embeddings = (cos, sin)
+    else:
+        position_embeddings = None
+
+    forward_kwargs = {}
+    if position_embeddings is not None:
+        forward_kwargs["position_embeddings"] = position_embeddings
 
 
     if args.resume:
@@ -220,9 +254,11 @@ def duquant(
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
                     for j in range(args.nsamples):
-                        fp_inps[j] = qlayer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+                        out = qlayer(fp_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids, **forward_kwargs)
+                        fp_inps[j] = out if is_fastdllm else out[0]
                         if args.aug_loss:
-                            fp_inps_2[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+                            out2 = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids, **forward_kwargs)
+                            fp_inps_2[j] = out2 if is_fastdllm else out2[0]
         
         # init smooth parameters
         set_quant_state(qlayer, weight_quant=False, act_quant=True)  # weight will be manually quantized before forward
@@ -279,7 +315,9 @@ def duquant(
                 with torch.no_grad():
                     with torch.cuda.amp.autocast():
                         set_registered_x_none(qlayer)
-                        rotate_inps = qlayer(rotate_inps.unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0][0]
+                        # print(f"DEBUG: rotate_inps type: {type(rotate_inps)}")
+                        out = qlayer(rotate_inps.unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids, **forward_kwargs)
+                        rotate_inps = out[0] if is_fastdllm else out[0][0]
             qlayer.register_duquant_params()
             set_init_duquant_params_state(qlayer, True)
         
@@ -329,7 +367,8 @@ def duquant(
                     # obtain output of quantization model
                     with traincast():
                         post_rotate_quant_temporary(qlayer, args)
-                        quant_out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids)[0]
+                        out = qlayer(quant_inps[index:index+args.batch_size,], attention_mask=attention_mask_batch,position_ids=position_ids, **forward_kwargs)
+                        quant_out = out if is_fastdllm else out[0]
                         loss = loss_func(fp_inps[index:index+args.batch_size,], quant_out)
                         if args.aug_loss:
                             loss += loss_func(fp_inps_2[index:index+args.batch_size,], quant_out)
@@ -368,7 +407,8 @@ def duquant(
             with torch.no_grad():
                 with torch.cuda.amp.autocast():
                     for j in range(args.nsamples):
-                        quant_inps[j] = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids)[0]
+                        out = qlayer(quant_inps[j].unsqueeze(0), attention_mask=attention_mask,position_ids=position_ids, **forward_kwargs)
+                        quant_inps[j] = out if is_fastdllm else out[0]
             register_scales_and_zeros(qlayer)
             layers[i] = qlayer.to("cpu")
             duquant_parameters[i] = duquant_state_dict(qlayer)
@@ -388,6 +428,8 @@ def duquant(
     if "llama" in args.net.lower() or "vicuna" in args.net.lower() or "dream" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.to('cpu')
         model.model.norm = model.model.norm.to('cpu')
+    elif "fast_dllm" in args.net.lower() or "fastdllm" in args.net.lower() or "fast_dllm" in args.model.lower() or "fastdllm" in args.model.lower():
+        pass
     elif "mistral" in args.net.lower():
         model.model.embed_tokens = model.model.embed_tokens.to('cpu')
         model.model.norm = model.model.norm.to('cpu')
